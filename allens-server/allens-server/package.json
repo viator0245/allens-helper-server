@@ -1,6 +1,9 @@
 {
   "name": "allens-helper-server",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "알렌의 서재 조건 해석 - AI 중계 서버",
-  "private": true
+  "private": true,
+  "dependencies": {
+    "redis": "^4.7.0"
+  }
 }
