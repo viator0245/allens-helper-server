@@ -10,7 +10,6 @@ async function getRedis() {
   return redisClient;
 }
 
-// 한국 시간 기준 날짜 문자열
 function getKoreaDate(offsetDays = 0) {
   const now = new Date();
   const korea = new Date(now.getTime() + 9 * 60 * 60 * 1000);
@@ -18,7 +17,6 @@ function getKoreaDate(offsetDays = 0) {
   return korea.toISOString().split("T")[0];
 }
 
-// 슬롯 번호(0~47)를 시간 문자열로 변환 ("00:00", "00:30", ...)
 function slotToTime(slot) {
   const hour = Math.floor(slot / 2);
   const minute = (slot % 2) * 30;
@@ -60,7 +58,7 @@ export default async function handler(req, res) {
       mauData.push({ month: monthStr, users: userCount });
     }
 
-    // 오늘 시간대별 호출 수 (30분 단위, 0~47 슬롯)
+    // 오늘 시간대별 호출 수
     const today = getKoreaDate(0);
     const slotData = [];
     for (let slot = 0; slot < 48; slot++) {
@@ -68,18 +66,38 @@ export default async function handler(req, res) {
       slotData.push({ slot, time: slotToTime(slot), calls: parseInt(count) });
     }
 
-    // 그래프 SVG 생성
-    const maxCalls = Math.max(...slotData.map((d) => d.calls), 1);
+    // ─── 그래프 SVG 설정 ───
+    const Y_MAX = 100;          // Y축 최대값
+    const Y_STEP = 10;          // Y축 눈금 간격
+    const chartHeight = 250;
     const barWidth = 14;
     const barGap = 2;
-    const chartHeight = 200;
-    const chartWidth = 48 * (barWidth + barGap);
+    const chartLeft = 40;       // Y축 라벨 자리
+    const chartTop = 10;
+    const chartInner = 48 * (barWidth + barGap);
+    const chartWidth = chartLeft + chartInner;
 
+    // Y축 격자선 + 라벨
+    const yGridLines = [];
+    const yLabels = [];
+    for (let y = 0; y <= Y_MAX; y += Y_STEP) {
+      const yPos = chartTop + chartHeight - (y / Y_MAX) * chartHeight;
+      // 점선 격자
+      yGridLines.push(
+        `<line x1="${chartLeft}" y1="${yPos}" x2="${chartLeft + chartInner}" y2="${yPos}" stroke="#d1d5db" stroke-width="1" stroke-dasharray="3,3"/>`
+      );
+      // 라벨
+      yLabels.push(
+        `<text x="${chartLeft - 6}" y="${yPos + 4}" font-size="11" fill="#6b7280" text-anchor="end">${y}</text>`
+      );
+    }
+
+    // 막대 그리기
     const bars = slotData
       .map((d, i) => {
-        const x = i * (barWidth + barGap);
-        const h = (d.calls / maxCalls) * chartHeight;
-        const y = chartHeight - h;
+        const x = chartLeft + i * (barWidth + barGap);
+        const h = Math.min(d.calls, Y_MAX) / Y_MAX * chartHeight;
+        const y = chartTop + chartHeight - h;
         return `<rect x="${x}" y="${y}" width="${barWidth}" height="${h}" fill="${d.calls > 0 ? "#4f46e5" : "#e5e7eb"}" rx="2">
           <title>${d.time}: ${d.calls}회</title>
         </rect>`;
@@ -87,11 +105,15 @@ export default async function handler(req, res) {
       .join("");
 
     // X축 라벨 (3시간마다)
-    const labels = [];
+    const xLabels = [];
     for (let h = 0; h <= 24; h += 3) {
-      const x = h * 2 * (barWidth + barGap);
-      labels.push(`<text x="${x}" y="${chartHeight + 20}" font-size="11" fill="#6b7280">${String(h).padStart(2, "0")}시</text>`);
+      const x = chartLeft + h * 2 * (barWidth + barGap);
+      xLabels.push(
+        `<text x="${x}" y="${chartTop + chartHeight + 20}" font-size="11" fill="#6b7280">${String(h).padStart(2, "0")}시</text>`
+      );
     }
+
+    const maxCalls = Math.max(...slotData.map((d) => d.calls), 0);
 
     const html = `<!DOCTYPE html>
 <html lang="ko">
@@ -117,12 +139,14 @@ th { background: #f9fafb; font-weight: 600; }
 
 <h2>📈 오늘 시간대별 호출 수 (30분 단위)</h2>
 <div class="chart-box">
-  <svg width="${chartWidth}" height="${chartHeight + 35}" xmlns="http://www.w3.org/2000/svg">
+  <svg width="${chartWidth}" height="${chartTop + chartHeight + 35}" xmlns="http://www.w3.org/2000/svg">
+    ${yGridLines.join("")}
+    ${yLabels.join("")}
     ${bars}
-    ${labels.join("")}
+    ${xLabels.join("")}
   </svg>
   <div class="chart-info">
-    오늘 (${today}) · 막대 위에 마우스 올리면 정확한 시간/횟수 · 최대값: ${maxCalls}회
+    오늘 (${today}) · 막대 위에 마우스 올리면 정확한 시간/횟수 · 현재 최대값: ${maxCalls}회
   </div>
 </div>
 
