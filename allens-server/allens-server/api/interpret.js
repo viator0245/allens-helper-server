@@ -1,5 +1,41 @@
 // api/interpret.js
 // Vercel 서버리스 함수 - 이용자 요청을 받아 OpenAI API로 중계
+// Redis로 DAU/MAU 추적
+
+import { createClient } from "redis";
+
+// Redis 연결 (싱글톤)
+let redisClient = null;
+async function getRedis() {
+  if (redisClient && redisClient.isOpen) return redisClient;
+  redisClient = createClient({ url: process.env.REDIS_URL });
+  redisClient.on("error", (err) => console.error("Redis 오류:", err));
+  await redisClient.connect();
+  return redisClient;
+}
+
+// 사용량 기록: 날짜별 SET에 userId 추가
+async function recordUsage(userId) {
+  if (!userId) return;
+  try {
+    const redis = await getRedis();
+    const today = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
+    const dayKey = `dau:${today}`;
+    const monthKey = `mau:${today.substring(0, 7)}`; // YYYY-MM
+    // SET 자료구조에 추가 (중복 자동 제거)
+    await redis.sAdd(dayKey, userId);
+    await redis.sAdd(monthKey, userId);
+    // 60일 후 자동 만료 (저장 공간 절약)
+    await redis.expire(dayKey, 60 * 24 * 60 * 60);
+    await redis.expire(monthKey, 60 * 24 * 60 * 60);
+    // 전체 호출 횟수 카운터도 증가
+    await redis.incr(`calls:${today}`);
+    await redis.expire(`calls:${today}`, 60 * 24 * 60 * 60);
+  } catch (err) {
+    console.error("사용량 기록 실패:", err);
+    // 기록 실패해도 본 기능은 계속 진행
+  }
+}
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -14,7 +50,7 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  const { questionText, explanationText } = req.body;
+  const { questionText, explanationText, userId } = req.body;
 
   if (!questionText || !explanationText) {
     return res.status(400).json({ error: "지문과 해설이 필요합니다." });
@@ -23,6 +59,9 @@ export default async function handler(req, res) {
   if (questionText.length > 5000 || explanationText.length > 10000) {
     return res.status(400).json({ error: "텍스트가 너무 깁니다." });
   }
+
+  // 사용량 기록 (병렬로, 응답을 막지 않음)
+  recordUsage(userId);
 
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
