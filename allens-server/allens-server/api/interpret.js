@@ -1,5 +1,5 @@
 // api/interpret.js
-// Vercel 서버리스 함수 - 이용자 요청을 받아 Gemini API로 중계
+// Vercel 서버리스 함수 - 이용자 요청을 받아 OpenAI API로 중계
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -24,7 +24,7 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "텍스트가 너무 깁니다." });
   }
 
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     return res.status(500).json({ error: "서버 설정 오류입니다." });
   }
@@ -58,29 +58,35 @@ export default async function handler(req, res) {
   const userPrompt = `[지문]\n${questionText}\n\n[해설]\n${explanationText}\n\n핵심 조건만 골라 매핑하세요.`;
 
   try {
-    const geminiRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          system_instruction: { parts: [{ text: systemPrompt }] },
-          contents: [{ parts: [{ text: userPrompt }] }],
-          generationConfig: { temperature: 0.2, responseMimeType: "application/json" },
-        }),
-      }
-    );
+    const openaiRes = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer " + apiKey,
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        response_format: { type: "json_object" },
+        temperature: 0.2,
+      }),
+    });
 
-    if (!geminiRes.ok) {
-      const errText = await geminiRes.text();
-      console.error("Gemini API 오류:", errText);
+    if (!openaiRes.ok) {
+      const errText = await openaiRes.text();
+      console.error("OpenAI API 오류:", errText);
       return res.status(502).json({ error: "AI 호출에 실패했습니다." });
     }
 
-    const geminiData = await geminiRes.json();
-    const content = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
+    const openaiData = await openaiRes.json();
+    const content = openaiData.choices?.[0]?.message?.content;
 
-    if (!content) return res.status(502).json({ error: "AI 응답이 비어 있습니다." });
+    if (!content) {
+      return res.status(502).json({ error: "AI 응답이 비어 있습니다." });
+    }
 
     let parsed;
     try {
