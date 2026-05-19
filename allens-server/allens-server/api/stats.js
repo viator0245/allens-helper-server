@@ -62,7 +62,7 @@ th { background: #f9fafb; }
 </head>
 <body>
 <h1>📊 알렌의 서재 조건 해석 — 사용 통계</h1>
-<p>업데이트: ${new Date().toLocaleString("ko-KR")}</p>
+<p>업데이트: ${new Date().toLocaleString("ko-KR", { timeZone: "Asia/Seoul", hour12: false })}</p>
 <h2>최근 7일 DAU</h2>
 <table>
 <thead><tr><th>날짜</th><th class="num">사용자</th><th class="num">호출</th></tr></thead>
