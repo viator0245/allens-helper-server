@@ -1,8 +1,7 @@
 // api/interpret.js
 // Vercel 서버리스 함수
-// - 서버 캐시: 한 번 해석한 문제는 Redis에 영구 저장
-// - 모델: gpt-5.4 (Standard)
-// - 캐시 키 prefix: problem_cache_v2 (모델 변경에 따라 기존 캐시와 분리)
+// - 서버 캐시: gpt-5.4 결과 영구 저장
+// - 토큰 사용량 추적: 호출마다 입력/출력 토큰 누적
 
 import { createClient } from "redis";
 import crypto from "crypto";
@@ -38,6 +37,7 @@ const RETENTION_CALLS = 365 * DAY;
 const RETENTION_MAU_SNAP = 365 * DAY;
 const RETENTION_COHORT = 365 * DAY;
 const RETENTION_FIRST_SEEN = 730 * DAY;
+const RETENTION_TOKENS = 730 * DAY; // 토큰 기록은 2년
 
 function hashText(text) {
   return crypto.createHash("sha256").update(text).digest("hex").substring(0, 16);
@@ -77,6 +77,38 @@ async function recordUsage(userId) {
   }
 }
 
+// AI 토큰 사용량 누적 기록
+async function recordTokens(promptTokens, completionTokens) {
+  try {
+    const redis = await getRedis();
+    const today = getKoreaDate();
+    const month = today.substring(0, 7);
+
+    // 오늘 / 이번달 / 전체 각각 누적
+    await redis.incrBy(`tokens_prompt:${today}`, promptTokens);
+    await redis.incrBy(`tokens_completion:${today}`, completionTokens);
+    await redis.expire(`tokens_prompt:${today}`, RETENTION_TOKENS);
+    await redis.expire(`tokens_completion:${today}`, RETENTION_TOKENS);
+
+    await redis.incrBy(`tokens_prompt:${month}`, promptTokens);
+    await redis.incrBy(`tokens_completion:${month}`, completionTokens);
+    await redis.expire(`tokens_prompt:${month}`, RETENTION_TOKENS);
+    await redis.expire(`tokens_completion:${month}`, RETENTION_TOKENS);
+
+    await redis.incrBy(`tokens_prompt:total`, promptTokens);
+    await redis.incrBy(`tokens_completion:total`, completionTokens);
+
+    // AI 호출 횟수 (캐시 미스 = 실제 AI 호출)
+    await redis.incr(`ai_calls:${today}`);
+    await redis.incr(`ai_calls:${month}`);
+    await redis.incr(`ai_calls:total`);
+    await redis.expire(`ai_calls:${today}`, RETENTION_TOKENS);
+    await redis.expire(`ai_calls:${month}`, RETENTION_TOKENS);
+  } catch (err) {
+    console.error("토큰 기록 실패:", err);
+  }
+}
+
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -101,7 +133,7 @@ export default async function handler(req, res) {
   try {
     const redis = await getRedis();
 
-    // ─── 캐시 확인 (새 prefix: v2) ───
+    // 캐시 확인
     const cacheKey = `problem_cache_v2:${hashText(questionText)}`;
     const cached = await redis.get(cacheKey);
 
@@ -182,6 +214,15 @@ ${explanationText}
     const openaiData = await openaiRes.json();
     const content = openaiData.choices?.[0]?.message?.content;
 
+    // ─── 토큰 사용량 기록 ───
+    if (openaiData.usage) {
+      const promptTokens = openaiData.usage.prompt_tokens || 0;
+      const completionTokens = openaiData.usage.completion_tokens || 0;
+      console.log(`[토큰] prompt=${promptTokens}, completion=${completionTokens}`);
+      // 비동기로 기록 (응답 차단 안 함)
+      recordTokens(promptTokens, completionTokens);
+    }
+
     if (!content) {
       return res.status(502).json({ error: "AI 응답이 비어 있습니다." });
     }
@@ -197,7 +238,6 @@ ${explanationText}
       return res.status(502).json({ error: "응답 형식 오류" });
     }
 
-    // 결과를 새 prefix 캐시에 영구 저장
     await redis.set(cacheKey, JSON.stringify(parsed.interpretations));
 
     return res.status(200).json({ data: parsed.interpretations });
