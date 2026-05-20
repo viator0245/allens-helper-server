@@ -288,7 +288,7 @@ export default async function handler(req, res) {
     }
 
     const hourlyChart = buildHourlyChart(hourlyData, 100, 10, "#4f46e5");
-    const cumulativeChart = buildHourlyChart(cumulativeData, 100, 10, "#10b981");
+    const cumulativeChart = buildHourlyChart(cumulativeData, 300, 20, "#10b981");
 
     // 이번 달 일별 MAU 그래프
     const maxMau = Math.max(...dailyMauData.map((d) => d.mau), 10);
