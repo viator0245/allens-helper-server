@@ -27,6 +27,16 @@ function getKoreaSlot() {
   return hour * 2 + (minute >= 30 ? 1 : 0);
 }
 
+// 보관 기간 상수 (초 단위)
+const DAY = 24 * 60 * 60;
+const RETENTION_DAU = 365 * DAY;       // DAU 1년
+const RETENTION_MAU = 365 * DAY;       // MAU도 1년 (일관성)
+const RETENTION_SLOT = 60 * DAY;       // 시간대 호출은 60일
+const RETENTION_CALLS = 365 * DAY;     // 일별 호출수 1년
+const RETENTION_MAU_SNAP = 365 * DAY;  // MAU 스냅샷 1년
+const RETENTION_COHORT = 365 * DAY;    // 코호트 1년 (12주 코호트의 12주 후까지 추적 가능)
+const RETENTION_FIRST_SEEN = 730 * DAY; // 첫 사용일은 2년
+
 async function recordUsage(userId) {
   if (!userId) return;
   try {
@@ -44,28 +54,26 @@ async function recordUsage(userId) {
     // DAU/MAU
     await redis.sAdd(dayKey, userId);
     await redis.sAdd(monthKey, userId);
-    await redis.expire(dayKey, 60 * 24 * 60 * 60);
-    await redis.expire(monthKey, 60 * 24 * 60 * 60);
+    await redis.expire(dayKey, RETENTION_DAU);
+    await redis.expire(monthKey, RETENTION_MAU);
 
     // 호출 카운터
     await redis.incr(`calls:${today}`);
-    await redis.expire(`calls:${today}`, 60 * 24 * 60 * 60);
+    await redis.expire(`calls:${today}`, RETENTION_CALLS);
     await redis.incr(slotKey);
-    await redis.expire(slotKey, 60 * 24 * 60 * 60);
+    await redis.expire(slotKey, RETENTION_SLOT);
 
     // MAU 스냅샷
     const currentMau = await redis.sCard(monthKey);
     await redis.set(mauSnapshotKey, currentMau);
-    await redis.expire(mauSnapshotKey, 90 * 24 * 60 * 60);
+    await redis.expire(mauSnapshotKey, RETENTION_MAU_SNAP);
 
-    // ─── Retention: 이 사용자의 첫 사용일 기록 ───
-    // 이미 기록이 있으면 덮어쓰지 않음 (NX 옵션)
+    // Retention: 첫 사용일 기록
     const isNewUser = await redis.set(firstSeenKey, today, { NX: true });
     if (isNewUser) {
-      // 새 사용자: 코호트(가입일 기준) SET에 추가
       await redis.sAdd(cohortKey, userId);
-      await redis.expire(cohortKey, 120 * 24 * 60 * 60); // 120일 보관 (코호트 분석용)
-      await redis.expire(firstSeenKey, 365 * 24 * 60 * 60); // 1년 보관
+      await redis.expire(cohortKey, RETENTION_COHORT);
+      await redis.expire(firstSeenKey, RETENTION_FIRST_SEEN);
     }
   } catch (err) {
     console.error("사용량 기록 실패:", err);
