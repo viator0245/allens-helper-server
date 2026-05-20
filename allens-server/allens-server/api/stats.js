@@ -58,6 +58,17 @@ function retentionToTextColor(pct) {
   return pct >= 50 ? "#ffffff" : "#111827";
 }
 
+// 토큰 → 비용 계산 (gpt-5.4 기준)
+// 입력: $2.50 / 1M, 출력: $15.00 / 1M
+// 환율 약 1,350원/달러 가정
+function calculateCost(promptTokens, completionTokens) {
+  const promptCostUsd = (promptTokens / 1_000_000) * 2.50;
+  const completionCostUsd = (completionTokens / 1_000_000) * 15.00;
+  const totalUsd = promptCostUsd + completionCostUsd;
+  const totalKrw = totalUsd * 1350;
+  return { usd: totalUsd, krw: totalKrw };
+}
+
 export default async function handler(req, res) {
   const password = req.query.password;
   const correctPassword = process.env.STATS_PASSWORD;
@@ -70,6 +81,32 @@ export default async function handler(req, res) {
     const redis = await getRedis();
     const today = getKoreaDate(0);
     const currentMonth = today.substring(0, 7);
+
+    // DB에 저장된 문제 수
+    let cachedProblemCount = 0;
+    try {
+      let cursor = 0;
+      do {
+        const result = await redis.scan(cursor, { MATCH: "problem_cache_v2:*", COUNT: 1000 });
+        cursor = result.cursor;
+        cachedProblemCount += result.keys.length;
+      } while (cursor !== 0);
+    } catch (e) {
+      console.error("캐시 개수 조회 실패:", e);
+    }
+
+    // 토큰 사용량 + 비용 조회 (오늘/이번달/전체)
+    async function getTokenStats(key) {
+      const prompt = parseInt((await redis.get(`tokens_prompt:${key}`)) || 0);
+      const completion = parseInt((await redis.get(`tokens_completion:${key}`)) || 0);
+      const aiCalls = parseInt((await redis.get(`ai_calls:${key}`)) || 0);
+      const cost = calculateCost(prompt, completion);
+      return { prompt, completion, total: prompt + completion, aiCalls, cost };
+    }
+
+    const todayTokens = await getTokenStats(today);
+    const monthTokens = await getTokenStats(currentMonth);
+    const totalTokens = await getTokenStats("total");
 
     // 최근 7일 DAU
     const dauData = [];
@@ -95,7 +132,7 @@ export default async function handler(req, res) {
       mauData.push({ month: monthStr, users: userCount });
     }
 
-    // 시간대별 호출 수 - 1시간 단위로 집계 (30분 슬롯 2개 합치기)
+    // 시간대별 호출 수
     const hourlyData = [];
     for (let hour = 0; hour < 24; hour++) {
       const slot1 = hour * 2;
@@ -105,14 +142,13 @@ export default async function handler(req, res) {
       hourlyData.push({ hour, calls: count1 + count2 });
     }
 
-    // 누적 호출 수 계산
     let cumulative = 0;
     const cumulativeData = hourlyData.map(d => {
       cumulative += d.calls;
       return { hour: d.hour, calls: cumulative };
     });
 
-    // 이번 달 일별 MAU 스냅샷
+    // 이번 달 일별 MAU
     const daysInMonth = getDaysInCurrentMonth();
     const currentDay = getCurrentDayOfMonth();
     const dailyMauData = [];
@@ -159,7 +195,7 @@ export default async function handler(req, res) {
     const rolling7 = totalUsers > 0 ? ((active7 / totalUsers) * 100).toFixed(1) : 0;
     const rolling30 = totalUsers > 0 ? ((active30 / totalUsers) * 100).toFixed(1) : 0;
 
-    // Cohort Retention Table (12주)
+    // Cohort Retention
     const COHORT_WEEKS = 12;
     const thisWeekMonday = getMondayOfWeek(today);
     const cohortTable = [];
@@ -185,16 +221,8 @@ export default async function handler(req, res) {
       const weekRetentions = [];
       for (let week = 0; week < COHORT_WEEKS; week++) {
         const measureWeekStart = addDays(weekStart, week * 7);
-
-        if (measureWeekStart > today) {
-          weekRetentions.push(null);
-          continue;
-        }
-
-        if (cohortSize === 0) {
-          weekRetentions.push(null);
-          continue;
-        }
+        if (measureWeekStart > today) { weekRetentions.push(null); continue; }
+        if (cohortSize === 0) { weekRetentions.push(null); continue; }
 
         const dauUnionKeys = [];
         for (let i = 0; i < 7; i++) {
@@ -203,24 +231,18 @@ export default async function handler(req, res) {
           dauUnionKeys.push(`dau:${d}`);
         }
 
-        if (dauUnionKeys.length === 0) {
-          weekRetentions.push(null);
-          continue;
-        }
+        if (dauUnionKeys.length === 0) { weekRetentions.push(null); continue; }
 
         try {
           const measureDauKey = `temp:measure_${weeksAgo}_${week}`;
           await redis.sUnionStore(measureDauKey, dauUnionKeys);
-
           const intersectKey = `temp:intersect_${weeksAgo}_${week}`;
           const intersectSize = await redis.sInterStore(
             intersectKey,
             [`temp:cohort_${weeksAgo}`, measureDauKey]
           );
-
           await redis.del(measureDauKey).catch(() => {});
           await redis.del(intersectKey).catch(() => {});
-
           const pct = (intersectSize / cohortSize) * 100;
           weekRetentions.push(Math.round(pct));
         } catch (e) {
@@ -229,7 +251,6 @@ export default async function handler(req, res) {
       }
 
       await redis.del(`temp:cohort_${weeksAgo}`).catch(() => {});
-
       cohortTable.push({
         period: `${weekStart} ~ ${weekEnd}`,
         cohortSize,
@@ -237,7 +258,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // ─── 그래프 그리는 헬퍼 함수 ───
+    // ─── 그래프 그리기 헬퍼 ───
     function buildHourlyChart(data, yMax, yStep, barColor) {
       const chartHeight = 220;
       const barWidth = 22;
@@ -290,7 +311,7 @@ export default async function handler(req, res) {
     const hourlyChart = buildHourlyChart(hourlyData, 100, 10, "#4f46e5");
     const cumulativeChart = buildHourlyChart(cumulativeData, 300, 20, "#10b981");
 
-    // 이번 달 일별 MAU 그래프
+    // 일별 MAU 그래프
     const maxMau = Math.max(...dailyMauData.map((d) => d.mau), 10);
     const mauYMax = Math.ceil(maxMau / 10) * 10 || 10;
     const mauYStep = Math.max(Math.ceil(mauYMax / 10), 1);
@@ -335,7 +356,6 @@ export default async function handler(req, res) {
       }
     }
 
-    // Cohort Heatmap
     const cohortHeaders = [];
     for (let w = 0; w < COHORT_WEEKS; w++) {
       cohortHeaders.push(`<th>W${w}</th>`);
@@ -356,6 +376,21 @@ export default async function handler(req, res) {
         ${cells}
       </tr>`;
     }).join("");
+
+    // 비용 카드 만들기 헬퍼
+    function costCard(label, tokens) {
+      return `
+        <div class="cost-card">
+          <div class="cost-label">${label}</div>
+          <div class="cost-amount">₩${Math.round(tokens.cost.krw).toLocaleString()}</div>
+          <div class="cost-amount-sub">($${tokens.cost.usd.toFixed(4)})</div>
+          <div class="cost-detail">
+            AI 호출 ${tokens.aiCalls.toLocaleString()}회<br>
+            입력 ${tokens.prompt.toLocaleString()} / 출력 ${tokens.completion.toLocaleString()} 토큰
+          </div>
+        </div>
+      `;
+    }
 
     const html = `<!DOCTYPE html>
 <html lang="ko">
@@ -393,14 +428,41 @@ th { background: #f9fafb; font-weight: 600; }
 .cohort-table thead th { background: #f3f4f6; color: #4b5563; }
 .cohort-scroll { overflow-x: auto; }
 
+.cost-box { margin-top: 16px; padding: 20px; background: #f9fafb; border-radius: 8px; }
+.cost-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.cost-card { background: white; padding: 16px; border-radius: 6px; border: 1px solid #e5e7eb; }
+.cost-label { font-size: 13px; color: #6b7280; margin-bottom: 8px; }
+.cost-amount { font-size: 24px; font-weight: 600; color: #dc2626; }
+.cost-amount-sub { font-size: 12px; color: #9ca3af; margin-top: 2px; }
+.cost-detail { font-size: 11px; color: #6b7280; margin-top: 8px; line-height: 1.5; }
+
 @media (max-width: 900px) {
-  .dual-chart-row { grid-template-columns: 1fr; }
+  .dual-chart-row, .cost-grid { grid-template-columns: 1fr; }
 }
 </style>
 </head>
 <body>
 <h1>📊 알렌의 서재 조건 해석 — 사용 통계</h1>
 <p style="color:#666;font-size:13px;">업데이트: ${new Date().toLocaleString("ko-KR", { timeZone: "Asia/Seoul" })}</p>
+
+<div style="margin-top:16px;padding:16px 20px;background:#eef2ff;border-radius:8px;border-left:4px solid #4f46e5;">
+  <div style="font-size:13px;color:#6b7280;">💾 DB에 저장된 해석</div>
+  <div style="font-size:24px;font-weight:600;color:#4f46e5;margin-top:4px;">${cachedProblemCount.toLocaleString()}<span style="font-size:14px;color:#6b7280;font-weight:400;"> 문제 / 약 8,000 문제</span></div>
+  <div style="font-size:12px;color:#9ca3af;margin-top:4px;">진행률: ${((cachedProblemCount / 8000) * 100).toFixed(1)}%</div>
+</div>
+
+<h2>💰 AI 사용량 및 비용 (gpt-5.4)</h2>
+<div class="cost-box">
+  <div class="cost-grid">
+    ${costCard("오늘", todayTokens)}
+    ${costCard("이번 달 (" + currentMonth + ")", monthTokens)}
+    ${costCard("전체 (누적)", totalTokens)}
+  </div>
+  <div class="chart-info" style="margin-top:16px;">
+    * 비용은 OpenAI 응답의 실제 토큰 사용량 × 단가(입력 $2.50/M, 출력 $15.00/M) 기준<br>
+    * 환율 1,350원/달러 가정 · 캐시 적중 시 AI 호출 없으므로 비용 0원
+  </div>
+</div>
 
 <h2>🔁 Retention (재방문 지표)</h2>
 <div class="retention-box">
@@ -494,7 +556,7 @@ ${mauData.map((d, i) => `<tr class="${i === 0 ? "today" : ""}"><td>${d.month}${i
 <p style="color:#999;font-size:12px;margin-top:40px;">
 * DAU/MAU는 익명 설치 ID 기준이며, 한 사람이 여러 기기에 설치하면 중복 계산될 수 있습니다.<br>
 * Retention은 코드 적용 이후 가입한 사용자부터 정확히 측정됩니다.<br>
-* DAU 데이터는 1년간 보관됩니다.
+* AI 비용은 토큰 추적 코드 적용 이후 발생한 호출만 집계됩니다.
 </p>
 </body>
 </html>`;
