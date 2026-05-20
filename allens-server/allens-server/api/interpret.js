@@ -1,8 +1,10 @@
 // api/interpret.js
-// Vercel 서버리스 함수 - 이용자 요청을 받아 OpenAI API로 중계
-// Redis로 DAU/MAU + 시간대별 호출수 + 일별 MAU 스냅샷 + Retention 추적
+// Vercel 서버리스 함수
+// - 서버 캐시: 한 번 해석한 문제는 Redis에 영구 저장하여 재호출 시 AI 비용 절약
+// - 캐시 키는 지문 텍스트의 해시로 생성 (확장 프로그램 수정 불필요)
 
 import { createClient } from "redis";
+import crypto from "crypto";
 
 let redisClient = null;
 async function getRedis() {
@@ -27,15 +29,19 @@ function getKoreaSlot() {
   return hour * 2 + (minute >= 30 ? 1 : 0);
 }
 
-// 보관 기간 상수 (초 단위)
 const DAY = 24 * 60 * 60;
-const RETENTION_DAU = 365 * DAY;       // DAU 1년
-const RETENTION_MAU = 365 * DAY;       // MAU도 1년 (일관성)
-const RETENTION_SLOT = 60 * DAY;       // 시간대 호출은 60일
-const RETENTION_CALLS = 365 * DAY;     // 일별 호출수 1년
-const RETENTION_MAU_SNAP = 365 * DAY;  // MAU 스냅샷 1년
-const RETENTION_COHORT = 365 * DAY;    // 코호트 1년 (12주 코호트의 12주 후까지 추적 가능)
-const RETENTION_FIRST_SEEN = 730 * DAY; // 첫 사용일은 2년
+const RETENTION_DAU = 365 * DAY;
+const RETENTION_MAU = 365 * DAY;
+const RETENTION_SLOT = 60 * DAY;
+const RETENTION_CALLS = 365 * DAY;
+const RETENTION_MAU_SNAP = 365 * DAY;
+const RETENTION_COHORT = 365 * DAY;
+const RETENTION_FIRST_SEEN = 730 * DAY;
+
+// 지문 텍스트의 해시 (캐시 키용)
+function hashText(text) {
+  return crypto.createHash("sha256").update(text).digest("hex").substring(0, 16);
+}
 
 async function recordUsage(userId) {
   if (!userId) return;
@@ -44,35 +50,26 @@ async function recordUsage(userId) {
     const today = getKoreaDate();
     const slot = getKoreaSlot();
     const month = today.substring(0, 7);
-    const dayKey = `dau:${today}`;
-    const monthKey = `mau:${month}`;
-    const slotKey = `slot:${today}:${slot}`;
-    const mauSnapshotKey = `mau_snapshot:${today}`;
-    const firstSeenKey = `first_seen:${userId}`;
-    const cohortKey = `cohort:${today}`;
 
-    // DAU/MAU
-    await redis.sAdd(dayKey, userId);
-    await redis.sAdd(monthKey, userId);
-    await redis.expire(dayKey, RETENTION_DAU);
-    await redis.expire(monthKey, RETENTION_MAU);
+    await redis.sAdd(`dau:${today}`, userId);
+    await redis.sAdd(`mau:${month}`, userId);
+    await redis.expire(`dau:${today}`, RETENTION_DAU);
+    await redis.expire(`mau:${month}`, RETENTION_MAU);
 
-    // 호출 카운터
     await redis.incr(`calls:${today}`);
     await redis.expire(`calls:${today}`, RETENTION_CALLS);
-    await redis.incr(slotKey);
-    await redis.expire(slotKey, RETENTION_SLOT);
+    await redis.incr(`slot:${today}:${slot}`);
+    await redis.expire(`slot:${today}:${slot}`, RETENTION_SLOT);
 
-    // MAU 스냅샷
-    const currentMau = await redis.sCard(monthKey);
-    await redis.set(mauSnapshotKey, currentMau);
-    await redis.expire(mauSnapshotKey, RETENTION_MAU_SNAP);
+    const currentMau = await redis.sCard(`mau:${month}`);
+    await redis.set(`mau_snapshot:${today}`, currentMau);
+    await redis.expire(`mau_snapshot:${today}`, RETENTION_MAU_SNAP);
 
-    // Retention: 첫 사용일 기록
+    const firstSeenKey = `first_seen:${userId}`;
     const isNewUser = await redis.set(firstSeenKey, today, { NX: true });
     if (isNewUser) {
-      await redis.sAdd(cohortKey, userId);
-      await redis.expire(cohortKey, RETENTION_COHORT);
+      await redis.sAdd(`cohort:${today}`, userId);
+      await redis.expire(`cohort:${today}`, RETENTION_COHORT);
       await redis.expire(firstSeenKey, RETENTION_FIRST_SEEN);
     }
   } catch (err) {
@@ -85,10 +82,7 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
-
+  if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
@@ -98,19 +92,35 @@ export default async function handler(req, res) {
   if (!questionText || !explanationText) {
     return res.status(400).json({ error: "지문과 해설이 필요합니다." });
   }
-
   if (questionText.length > 5000 || explanationText.length > 10000) {
     return res.status(400).json({ error: "텍스트가 너무 깁니다." });
   }
 
+  // 사용량 기록 (캐시 히트든 미스든 동일하게)
   recordUsage(userId);
 
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    return res.status(500).json({ error: "서버 설정 오류입니다." });
-  }
+  try {
+    const redis = await getRedis();
 
-  const systemPrompt = `당신은 한국 의사 국가고시 문제를 분석하는 의학 전문가입니다.
+    // ─── 캐시 확인 ───
+    // 캐시 키는 지문 해시. 같은 지문이면 캐시 히트, 지문 수정되면 자동으로 새 호출
+    const cacheKey = `problem_cache:${hashText(questionText)}`;
+    const cached = await redis.get(cacheKey);
+
+    if (cached) {
+      console.log("[캐시 히트] 키:", cacheKey);
+      return res.status(200).json({ data: JSON.parse(cached) });
+    }
+
+    // ─── 캐시 없음 → AI 호출 ───
+    console.log("[캐시 미스] AI 호출");
+
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: "서버 설정 오류입니다." });
+    }
+
+    const systemPrompt = `당신은 한국 의사 국가고시 문제를 분석하는 의학 전문가입니다.
 사용자가 문제 지문과 해설을 줄 것이고, 당신의 임무는 답을 도출하는 추론 과정에 실제로 기여하는 핵심 조건만 골라서, 그 임상적 의미를 매핑하는 것입니다.
 
 [최우선 원칙]
@@ -141,7 +151,7 @@ export default async function handler(req, res) {
 
 {"interpretations":[{"phrase":"원문 문구","short":"요약","long":"설명"}]}`;
 
-  const userPrompt = `[지문]
+    const userPrompt = `[지문]
 ${questionText}
 
 [해설]
@@ -149,7 +159,6 @@ ${explanationText}
 
 해설의 추론에 실제로 기여한 핵심 조건만 골라 매핑하세요. 해설에 근거 없는 항목은 절대 포함하지 마세요.`;
 
-  try {
     const openaiRes = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -190,6 +199,9 @@ ${explanationText}
     if (!Array.isArray(parsed.interpretations)) {
       return res.status(502).json({ error: "응답 형식 오류" });
     }
+
+    // ─── 결과를 캐시에 영구 저장 ───
+    await redis.set(cacheKey, JSON.stringify(parsed.interpretations));
 
     return res.status(200).json({ data: parsed.interpretations });
 
