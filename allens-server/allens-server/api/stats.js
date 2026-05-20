@@ -17,12 +17,6 @@ function getKoreaDate(offsetDays = 0) {
   return korea.toISOString().split("T")[0];
 }
 
-function slotToTime(slot) {
-  const hour = Math.floor(slot / 2);
-  const minute = (slot % 2) * 30;
-  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
-}
-
 function getDaysInCurrentMonth() {
   const now = new Date();
   const korea = new Date(now.getTime() + 9 * 60 * 60 * 1000);
@@ -53,18 +47,14 @@ function getMondayOfWeek(dateStr) {
   return addDays(dateStr, -daysBack);
 }
 
-// retention 값(0~100)을 색상으로 변환 (heatmap)
 function retentionToColor(pct) {
-  if (pct === null) return "#f9fafb"; // 측정 전: 거의 흰색
-  // 0% → 매우 옅은 파랑, 100% → 진한 보라
-  // HSL로 변환: 색상은 보라(265), 채도 70%, 명도는 95%(0%)에서 30%(100%)로
+  if (pct === null) return "#f9fafb";
   const lightness = 95 - (pct / 100) * 65;
   return `hsl(250, 70%, ${lightness}%)`;
 }
 
 function retentionToTextColor(pct) {
   if (pct === null) return "#9ca3af";
-  // 50% 이상이면 흰색, 미만이면 어두운 색
   return pct >= 50 ? "#ffffff" : "#111827";
 }
 
@@ -81,7 +71,7 @@ export default async function handler(req, res) {
     const today = getKoreaDate(0);
     const currentMonth = today.substring(0, 7);
 
-    // ─── 최근 7일 DAU ───
+    // 최근 7일 DAU
     const dauData = [];
     for (let i = 0; i < 7; i++) {
       const dateStr = getKoreaDate(-i);
@@ -94,7 +84,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // ─── 최근 3개월 MAU ───
+    // 최근 3개월 MAU
     const mauData = [];
     for (let i = 0; i < 3; i++) {
       const now = new Date();
@@ -105,14 +95,24 @@ export default async function handler(req, res) {
       mauData.push({ month: monthStr, users: userCount });
     }
 
-    // ─── 시간대별 호출 수 ───
-    const slotData = [];
-    for (let slot = 0; slot < 48; slot++) {
-      const count = (await redis.get(`slot:${today}:${slot}`)) || 0;
-      slotData.push({ slot, time: slotToTime(slot), calls: parseInt(count) });
+    // 시간대별 호출 수 - 1시간 단위로 집계 (30분 슬롯 2개 합치기)
+    const hourlyData = [];
+    for (let hour = 0; hour < 24; hour++) {
+      const slot1 = hour * 2;
+      const slot2 = hour * 2 + 1;
+      const count1 = parseInt((await redis.get(`slot:${today}:${slot1}`)) || 0);
+      const count2 = parseInt((await redis.get(`slot:${today}:${slot2}`)) || 0);
+      hourlyData.push({ hour, calls: count1 + count2 });
     }
 
-    // ─── 이번 달 일별 MAU 스냅샷 ───
+    // 누적 호출 수 계산
+    let cumulative = 0;
+    const cumulativeData = hourlyData.map(d => {
+      cumulative += d.calls;
+      return { hour: d.hour, calls: cumulative };
+    });
+
+    // 이번 달 일별 MAU 스냅샷
     const daysInMonth = getDaysInCurrentMonth();
     const currentDay = getCurrentDayOfMonth();
     const dailyMauData = [];
@@ -127,12 +127,11 @@ export default async function handler(req, res) {
       dailyMauData.push({ day, date: dateStr, mau: mauValue, isFuture });
     }
 
-    // ─── Retention 지표 ───
+    // Retention 지표
     const todayDau = await redis.sCard(`dau:${today}`);
     const thisMau = await redis.sCard(`mau:${currentMonth}`);
     const stickiness = thisMau > 0 ? ((todayDau / thisMau) * 100).toFixed(1) : 0;
 
-    // Rolling Retention
     const cohortKeys90 = [];
     for (let i = 0; i < 90; i++) cohortKeys90.push(`cohort:${getKoreaDate(-i)}`);
     let totalUsers = 0;
@@ -160,7 +159,7 @@ export default async function handler(req, res) {
     const rolling7 = totalUsers > 0 ? ((active7 / totalUsers) * 100).toFixed(1) : 0;
     const rolling30 = totalUsers > 0 ? ((active30 / totalUsers) * 100).toFixed(1) : 0;
 
-    // ─── Cohort Retention Table (12주) ───
+    // Cohort Retention Table (12주)
     const COHORT_WEEKS = 12;
     const thisWeekMonday = getMondayOfWeek(today);
     const cohortTable = [];
@@ -169,7 +168,6 @@ export default async function handler(req, res) {
       const weekStart = addDays(thisWeekMonday, -weeksAgo * 7);
       const weekEnd = addDays(weekStart, 6);
 
-      // 그 주에 처음 들어온 사용자 (코호트)
       const weekCohortKeys = [];
       for (let i = 0; i < 7; i++) {
         const d = addDays(weekStart, i);
@@ -184,15 +182,10 @@ export default async function handler(req, res) {
         } catch (e) { cohortSize = 0; }
       }
 
-      // Week 0 ~ Week 11 retention 계산
       const weekRetentions = [];
       for (let week = 0; week < COHORT_WEEKS; week++) {
-        // 이 코호트가 (가입 주 + week) 주차에 활성이었는지
-        // 측정 주의 월요일 = weekStart + (week * 7)일
         const measureWeekStart = addDays(weekStart, week * 7);
-        const measureWeekEnd = addDays(measureWeekStart, 6);
 
-        // 측정 주가 미래면 측정 불가
         if (measureWeekStart > today) {
           weekRetentions.push(null);
           continue;
@@ -203,7 +196,6 @@ export default async function handler(req, res) {
           continue;
         }
 
-        // 측정 주의 DAU 합집합 (월~일 중 오늘까지)
         const dauUnionKeys = [];
         for (let i = 0; i < 7; i++) {
           const d = addDays(measureWeekStart, i);
@@ -245,49 +237,60 @@ export default async function handler(req, res) {
       });
     }
 
-    // ─── 시간대별 호출 그래프 ───
-    const Y_MAX = 100;
-    const Y_STEP = 10;
-    const chartHeight = 250;
-    const barWidth = 14;
-    const barGap = 2;
-    const chartLeft = 40;
-    const chartTop = 10;
-    const chartInner = 48 * (barWidth + barGap);
-    const chartWidth = chartLeft + chartInner;
+    // ─── 그래프 그리는 헬퍼 함수 ───
+    function buildHourlyChart(data, yMax, yStep, barColor) {
+      const chartHeight = 220;
+      const barWidth = 22;
+      const barGap = 4;
+      const chartLeft = 36;
+      const chartTop = 10;
+      const chartInner = 24 * (barWidth + barGap);
+      const chartWidth = chartLeft + chartInner;
 
-    const yGridLines = [];
-    const yLabels = [];
-    for (let y = 0; y <= Y_MAX; y += Y_STEP) {
-      const yPos = chartTop + chartHeight - (y / Y_MAX) * chartHeight;
-      yGridLines.push(
-        `<line x1="${chartLeft}" y1="${yPos}" x2="${chartLeft + chartInner}" y2="${yPos}" stroke="#d1d5db" stroke-width="1" stroke-dasharray="3,3"/>`
-      );
-      yLabels.push(
-        `<text x="${chartLeft - 6}" y="${yPos + 4}" font-size="11" fill="#6b7280" text-anchor="end">${y}</text>`
-      );
+      const yGridLines = [];
+      const yLabels = [];
+      for (let y = 0; y <= yMax; y += yStep) {
+        const yPos = chartTop + chartHeight - (y / yMax) * chartHeight;
+        yGridLines.push(
+          `<line x1="${chartLeft}" y1="${yPos}" x2="${chartLeft + chartInner}" y2="${yPos}" stroke="#d1d5db" stroke-width="1" stroke-dasharray="3,3"/>`
+        );
+        yLabels.push(
+          `<text x="${chartLeft - 6}" y="${yPos + 4}" font-size="11" fill="#6b7280" text-anchor="end">${y}</text>`
+        );
+      }
+
+      const bars = data.map((d) => {
+        const x = chartLeft + d.hour * (barWidth + barGap);
+        const h = Math.min(d.calls, yMax) / yMax * chartHeight;
+        const y = chartTop + chartHeight - h;
+        return `<rect x="${x}" y="${y}" width="${barWidth}" height="${h}" fill="${d.calls > 0 ? barColor : "#e5e7eb"}" rx="2">
+          <title>${String(d.hour).padStart(2, "0")}시: ${d.calls}회</title>
+        </rect>`;
+      }).join("");
+
+      const xLabels = [];
+      for (let h = 0; h <= 24; h += 3) {
+        const x = chartLeft + h * (barWidth + barGap);
+        xLabels.push(
+          `<text x="${x}" y="${chartTop + chartHeight + 20}" font-size="11" fill="#6b7280">${String(h).padStart(2, "0")}시</text>`
+        );
+      }
+
+      return {
+        svg: `<svg width="${chartWidth}" height="${chartTop + chartHeight + 35}" xmlns="http://www.w3.org/2000/svg">
+          ${yGridLines.join("")}
+          ${yLabels.join("")}
+          ${bars}
+          ${xLabels.join("")}
+        </svg>`,
+        maxValue: Math.max(...data.map(d => d.calls), 0),
+      };
     }
 
-    const bars = slotData.map((d, i) => {
-      const x = chartLeft + i * (barWidth + barGap);
-      const h = Math.min(d.calls, Y_MAX) / Y_MAX * chartHeight;
-      const y = chartTop + chartHeight - h;
-      return `<rect x="${x}" y="${y}" width="${barWidth}" height="${h}" fill="${d.calls > 0 ? "#4f46e5" : "#e5e7eb"}" rx="2">
-        <title>${d.time}: ${d.calls}회</title>
-      </rect>`;
-    }).join("");
+    const hourlyChart = buildHourlyChart(hourlyData, 100, 10, "#4f46e5");
+    const cumulativeChart = buildHourlyChart(cumulativeData, 100, 10, "#10b981");
 
-    const xLabels = [];
-    for (let h = 0; h <= 24; h += 3) {
-      const x = chartLeft + h * 2 * (barWidth + barGap);
-      xLabels.push(
-        `<text x="${x}" y="${chartTop + chartHeight + 20}" font-size="11" fill="#6b7280">${String(h).padStart(2, "0")}시</text>`
-      );
-    }
-
-    const maxCalls = Math.max(...slotData.map((d) => d.calls), 0);
-
-    // ─── 이번 달 일별 MAU 그래프 ───
+    // 이번 달 일별 MAU 그래프
     const maxMau = Math.max(...dailyMauData.map((d) => d.mau), 10);
     const mauYMax = Math.ceil(maxMau / 10) * 10 || 10;
     const mauYStep = Math.max(Math.ceil(mauYMax / 10), 1);
@@ -332,7 +335,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // ─── Cohort Retention Heatmap HTML 생성 ───
+    // Cohort Heatmap
     const cohortHeaders = [];
     for (let w = 0; w < COHORT_WEEKS; w++) {
       cohortHeaders.push(`<th>W${w}</th>`);
@@ -369,8 +372,12 @@ th, td { padding: 10px; text-align: left; border-bottom: 1px solid #eee; }
 th { background: #f9fafb; font-weight: 600; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
 .today { background: #fef3c7; }
-.chart-box { margin-top: 16px; overflow-x: auto; padding: 16px; background: #f9fafb; border-radius: 8px; }
+.chart-box { margin-top: 16px; padding: 16px; background: #f9fafb; border-radius: 8px; }
 .chart-info { color: #6b7280; font-size: 12px; margin-top: 8px; }
+.chart-title { font-size: 13px; color: #4b5563; font-weight: 600; margin-bottom: 8px; }
+
+.dual-chart-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px; }
+.dual-chart-box { padding: 16px; background: #f9fafb; border-radius: 8px; overflow-x: auto; }
 
 .retention-box { margin-top: 16px; padding: 20px; background: #f9fafb; border-radius: 8px; }
 .metric-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 24px; }
@@ -385,6 +392,10 @@ th { background: #f9fafb; font-weight: 600; }
 .cohort-table .period-col { text-align: left; font-size: 11px; white-space: nowrap; }
 .cohort-table thead th { background: #f3f4f6; color: #4b5563; }
 .cohort-scroll { overflow-x: auto; }
+
+@media (max-width: 900px) {
+  .dual-chart-row { grid-template-columns: 1fr; }
+}
 </style>
 </head>
 <body>
@@ -433,21 +444,26 @@ th { background: #f9fafb; font-weight: 600; }
   </div>
 </div>
 
-<h2>📈 오늘 시간대별 호출 수 (30분 단위)</h2>
-<div class="chart-box">
-  <svg width="${chartWidth}" height="${chartTop + chartHeight + 35}" xmlns="http://www.w3.org/2000/svg">
-    ${yGridLines.join("")}
-    ${yLabels.join("")}
-    ${bars}
-    ${xLabels.join("")}
-  </svg>
-  <div class="chart-info">
-    오늘 (${today}) · 막대 위에 마우스 올리면 정확한 시간/횟수 · 현재 최대값: ${maxCalls}회
+<h2>📈 오늘 시간대별 호출 수 (1시간 단위)</h2>
+<div class="dual-chart-row">
+  <div class="dual-chart-box">
+    <div class="chart-title">시간대별 호출 수</div>
+    ${hourlyChart.svg}
+    <div class="chart-info">
+      해당 시간대에 발생한 호출 횟수 · 현재 최대값: ${hourlyChart.maxValue}회
+    </div>
+  </div>
+  <div class="dual-chart-box">
+    <div class="chart-title">시간대별 누적 호출 수</div>
+    ${cumulativeChart.svg}
+    <div class="chart-info">
+      자정부터 해당 시간까지 누적된 호출 횟수 · 현재 누적: ${cumulativeChart.maxValue}회
+    </div>
   </div>
 </div>
 
 <h2>📅 이번 달 일별 MAU 추이 (${currentMonth})</h2>
-<div class="chart-box">
+<div class="chart-box" style="overflow-x:auto;">
   <svg width="${mauChartWidth}" height="${mauChartTop + mauChartHeight + 35}" xmlns="http://www.w3.org/2000/svg">
     ${mauYGridLines.join("")}
     ${mauYLabels.join("")}
