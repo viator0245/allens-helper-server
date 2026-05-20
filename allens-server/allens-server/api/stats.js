@@ -43,17 +43,29 @@ function addDays(dateStr, days) {
   return date.toISOString().split("T")[0];
 }
 
-// 날짜의 요일 (0=일, 1=월, ..., 6=토)
 function getDayOfWeek(dateStr) {
   return new Date(dateStr + "T00:00:00Z").getUTCDay();
 }
 
-// 주어진 날짜가 속한 주의 월요일 날짜
 function getMondayOfWeek(dateStr) {
-  const dow = getDayOfWeek(dateStr); // 0=일, 1=월, ..., 6=토
-  // 일요일이면 6일 전이 월요일, 그 외엔 (dow-1)일 전
+  const dow = getDayOfWeek(dateStr);
   const daysBack = dow === 0 ? 6 : dow - 1;
   return addDays(dateStr, -daysBack);
+}
+
+// retention 값(0~100)을 색상으로 변환 (heatmap)
+function retentionToColor(pct) {
+  if (pct === null) return "#f9fafb"; // 측정 전: 거의 흰색
+  // 0% → 매우 옅은 파랑, 100% → 진한 보라
+  // HSL로 변환: 색상은 보라(265), 채도 70%, 명도는 95%(0%)에서 30%(100%)로
+  const lightness = 95 - (pct / 100) * 65;
+  return `hsl(250, 70%, ${lightness}%)`;
+}
+
+function retentionToTextColor(pct) {
+  if (pct === null) return "#9ca3af";
+  // 50% 이상이면 흰색, 미만이면 어두운 색
+  return pct >= 50 ? "#ffffff" : "#111827";
 }
 
 export default async function handler(req, res) {
@@ -115,25 +127,19 @@ export default async function handler(req, res) {
       dailyMauData.push({ day, date: dateStr, mau: mauValue, isFuture });
     }
 
-    // ─── Retention 계산 ───
-
-    // 1. Stickiness
+    // ─── Retention 지표 ───
     const todayDau = await redis.sCard(`dau:${today}`);
     const thisMau = await redis.sCard(`mau:${currentMonth}`);
     const stickiness = thisMau > 0 ? ((todayDau / thisMau) * 100).toFixed(1) : 0;
 
-    // 2. Rolling Retention
+    // Rolling Retention
     const cohortKeys90 = [];
-    for (let i = 0; i < 90; i++) {
-      cohortKeys90.push(`cohort:${getKoreaDate(-i)}`);
-    }
+    for (let i = 0; i < 90; i++) cohortKeys90.push(`cohort:${getKoreaDate(-i)}`);
     let totalUsers = 0;
     try {
       totalUsers = await redis.sUnionStore("temp:total_users", cohortKeys90);
       await redis.del("temp:total_users");
-    } catch (e) {
-      totalUsers = 0;
-    }
+    } catch (e) { totalUsers = 0; }
 
     const dauKeys7 = [];
     for (let i = 0; i < 7; i++) dauKeys7.push(`dau:${getKoreaDate(-i)}`);
@@ -141,9 +147,7 @@ export default async function handler(req, res) {
     try {
       active7 = await redis.sUnionStore("temp:active7", dauKeys7);
       await redis.del("temp:active7");
-    } catch (e) {
-      active7 = 0;
-    }
+    } catch (e) { active7 = 0; }
 
     const dauKeys30 = [];
     for (let i = 0; i < 30; i++) dauKeys30.push(`dau:${getKoreaDate(-i)}`);
@@ -151,27 +155,24 @@ export default async function handler(req, res) {
     try {
       active30 = await redis.sUnionStore("temp:active30", dauKeys30);
       await redis.del("temp:active30");
-    } catch (e) {
-      active30 = 0;
-    }
+    } catch (e) { active30 = 0; }
 
     const rolling7 = totalUsers > 0 ? ((active7 / totalUsers) * 100).toFixed(1) : 0;
     const rolling30 = totalUsers > 0 ? ((active30 / totalUsers) * 100).toFixed(1) : 0;
 
-    // 3. Day-N Retention: 월~일 고정 주별 코호트
-    // 이번 주의 월요일을 기준으로, 최근 4주의 월~일 구간을 만든다
+    // ─── Cohort Retention Table (12주) ───
+    const COHORT_WEEKS = 12;
     const thisWeekMonday = getMondayOfWeek(today);
-    const retentionTable = [];
+    const cohortTable = [];
 
-    for (let weeksAgo = 0; weeksAgo < 4; weeksAgo++) {
-      const weekStart = addDays(thisWeekMonday, -weeksAgo * 7);  // 월요일
-      const weekEnd = addDays(weekStart, 6);                      // 일요일
+    for (let weeksAgo = 0; weeksAgo < COHORT_WEEKS; weeksAgo++) {
+      const weekStart = addDays(thisWeekMonday, -weeksAgo * 7);
+      const weekEnd = addDays(weekStart, 6);
 
-      // 그 주(월~일) 7일간의 코호트 키들
+      // 그 주에 처음 들어온 사용자 (코호트)
       const weekCohortKeys = [];
       for (let i = 0; i < 7; i++) {
         const d = addDays(weekStart, i);
-        // 미래 날짜는 제외
         if (d > today) break;
         weekCohortKeys.push(`cohort:${d}`);
       }
@@ -179,49 +180,68 @@ export default async function handler(req, res) {
       let cohortSize = 0;
       if (weekCohortKeys.length > 0) {
         try {
-          cohortSize = await redis.sUnionStore(`temp:week_cohort_${weeksAgo}`, weekCohortKeys);
-        } catch (e) {
-          cohortSize = 0;
+          cohortSize = await redis.sUnionStore(`temp:cohort_${weeksAgo}`, weekCohortKeys);
+        } catch (e) { cohortSize = 0; }
+      }
+
+      // Week 0 ~ Week 11 retention 계산
+      const weekRetentions = [];
+      for (let week = 0; week < COHORT_WEEKS; week++) {
+        // 이 코호트가 (가입 주 + week) 주차에 활성이었는지
+        // 측정 주의 월요일 = weekStart + (week * 7)일
+        const measureWeekStart = addDays(weekStart, week * 7);
+        const measureWeekEnd = addDays(measureWeekStart, 6);
+
+        // 측정 주가 미래면 측정 불가
+        if (measureWeekStart > today) {
+          weekRetentions.push(null);
+          continue;
         }
-      }
 
-      if (cohortSize === 0) {
-        await redis.del(`temp:week_cohort_${weeksAgo}`).catch(() => {});
-        retentionTable.push({
-          period: `${weekStart} ~ ${weekEnd}`,
-          cohortSize: 0,
-          d1: null, d7: null, d14: null, d30: null,
-        });
-        continue;
-      }
+        if (cohortSize === 0) {
+          weekRetentions.push(null);
+          continue;
+        }
 
-      // Day-N retention: 주 마지막 날(weekEnd)로부터 N일 후의 DAU와 교집합
-      const calcRetention = async (daysOffset) => {
-        const targetDate = addDays(weekEnd, daysOffset);
-        if (targetDate > today) return null;
+        // 측정 주의 DAU 합집합 (월~일 중 오늘까지)
+        const dauUnionKeys = [];
+        for (let i = 0; i < 7; i++) {
+          const d = addDays(measureWeekStart, i);
+          if (d > today) break;
+          dauUnionKeys.push(`dau:${d}`);
+        }
+
+        if (dauUnionKeys.length === 0) {
+          weekRetentions.push(null);
+          continue;
+        }
+
         try {
-          const intersect = await redis.sInterStore(
-            `temp:retention_${weeksAgo}_${daysOffset}`,
-            [`temp:week_cohort_${weeksAgo}`, `dau:${targetDate}`]
+          const measureDauKey = `temp:measure_${weeksAgo}_${week}`;
+          await redis.sUnionStore(measureDauKey, dauUnionKeys);
+
+          const intersectKey = `temp:intersect_${weeksAgo}_${week}`;
+          const intersectSize = await redis.sInterStore(
+            intersectKey,
+            [`temp:cohort_${weeksAgo}`, measureDauKey]
           );
-          await redis.del(`temp:retention_${weeksAgo}_${daysOffset}`);
-          return cohortSize > 0 ? ((intersect / cohortSize) * 100).toFixed(0) : 0;
+
+          await redis.del(measureDauKey).catch(() => {});
+          await redis.del(intersectKey).catch(() => {});
+
+          const pct = (intersectSize / cohortSize) * 100;
+          weekRetentions.push(Math.round(pct));
         } catch (e) {
-          return null;
+          weekRetentions.push(null);
         }
-      };
+      }
 
-      const d1 = await calcRetention(1);
-      const d7 = await calcRetention(7);
-      const d14 = await calcRetention(14);
-      const d30 = await calcRetention(30);
+      await redis.del(`temp:cohort_${weeksAgo}`).catch(() => {});
 
-      await redis.del(`temp:week_cohort_${weeksAgo}`).catch(() => {});
-
-      retentionTable.push({
+      cohortTable.push({
         period: `${weekStart} ~ ${weekEnd}`,
         cohortSize,
-        d1, d7, d14, d30,
+        retentions: weekRetentions,
       });
     }
 
@@ -312,10 +332,27 @@ export default async function handler(req, res) {
       }
     }
 
-    const formatRetention = (val) => {
-      if (val === null) return '<span style="color:#9ca3af;">측정 전</span>';
-      return `${val}%`;
-    };
+    // ─── Cohort Retention Heatmap HTML 생성 ───
+    const cohortHeaders = [];
+    for (let w = 0; w < COHORT_WEEKS; w++) {
+      cohortHeaders.push(`<th>W${w}</th>`);
+    }
+
+    const cohortRows = cohortTable.map(row => {
+      const cells = row.retentions.map(pct => {
+        if (pct === null) {
+          return `<td style="background:#f9fafb;color:#d1d5db;">–</td>`;
+        }
+        const bgColor = retentionToColor(pct);
+        const textColor = retentionToTextColor(pct);
+        return `<td style="background:${bgColor};color:${textColor};font-weight:600;">${pct}%</td>`;
+      }).join("");
+      return `<tr>
+        <td class="period-col">${row.period}</td>
+        <td>${row.cohortSize}명</td>
+        ${cells}
+      </tr>`;
+    }).join("");
 
     const html = `<!DOCTYPE html>
 <html lang="ko">
@@ -323,9 +360,10 @@ export default async function handler(req, res) {
 <meta charset="UTF-8">
 <title>알렌의 서재 조건 해석 - 통계</title>
 <style>
-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 1000px; margin: 40px auto; padding: 20px; color: #222; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 1200px; margin: 40px auto; padding: 20px; color: #222; }
 h1 { font-size: 22px; }
 h2 { font-size: 16px; margin-top: 30px; color: #4f46e5; }
+h3 { font-size: 14px; color: #4f46e5; margin-top: 24px; }
 table { width: 100%; border-collapse: collapse; margin-top: 12px; }
 th, td { padding: 10px; text-align: left; border-bottom: 1px solid #eee; }
 th { background: #f9fafb; font-weight: 600; }
@@ -341,8 +379,12 @@ th { background: #f9fafb; font-weight: 600; }
 .metric-value { font-size: 28px; font-weight: 600; color: #111827; }
 .metric-value small { font-size: 14px; color: #6b7280; font-weight: 400; }
 .metric-desc { font-size: 11px; color: #9ca3af; margin-top: 4px; }
-.retention-table th, .retention-table td { text-align: center; font-size: 13px; }
-.retention-table .period-col { text-align: left; }
+
+.cohort-table { background: white; border-radius: 6px; overflow: hidden; }
+.cohort-table th, .cohort-table td { text-align: center; font-size: 12px; padding: 8px 6px; border: 1px solid #e5e7eb; }
+.cohort-table .period-col { text-align: left; font-size: 11px; white-space: nowrap; }
+.cohort-table thead th { background: #f3f4f6; color: #4b5563; }
+.cohort-scroll { overflow-x: auto; }
 </style>
 </head>
 <body>
@@ -369,33 +411,25 @@ th { background: #f9fafb; font-weight: 600; }
     </div>
   </div>
 
-  <h3 style="font-size:14px;color:#4f46e5;margin-top:8px;">Day-N Retention (주별 코호트, 월~일 기준)</h3>
-  <table class="retention-table">
-    <thead>
-      <tr>
-        <th class="period-col">가입 주차</th>
-        <th>신규</th>
-        <th>Day 1</th>
-        <th>Day 7</th>
-        <th>Day 14</th>
-        <th>Day 30</th>
-      </tr>
-    </thead>
-    <tbody>
-      ${retentionTable.map(r => `
+  <h3>📊 Cohort Retention Table (12주 추이, 월~일 기준)</h3>
+  <div class="cohort-scroll">
+    <table class="cohort-table">
+      <thead>
         <tr>
-          <td class="period-col">${r.period}</td>
-          <td>${r.cohortSize}명</td>
-          <td>${formatRetention(r.d1)}</td>
-          <td>${formatRetention(r.d7)}</td>
-          <td>${formatRetention(r.d14)}</td>
-          <td>${formatRetention(r.d30)}</td>
+          <th class="period-col">가입 주차</th>
+          <th>신규</th>
+          ${cohortHeaders.join("")}
         </tr>
-      `).join("")}
-    </tbody>
-  </table>
+      </thead>
+      <tbody>
+        ${cohortRows}
+      </tbody>
+    </table>
+  </div>
   <div class="chart-info">
-    각 주차(월~일)에 처음 들어온 사용자 중 N일 후에도 사용한 비율 · "측정 전"은 아직 N일이 지나지 않음
+    각 행 = 그 주에 처음 들어온 사용자 코호트 · W0 = 가입한 주차, W1 = 그 다음 주, ...<br>
+    예: "W2 30%" = 가입한 지 2주 후에도 30%가 다시 사용 · "–" = 측정 전 (미래)<br>
+    색이 진할수록 retention 높음
   </div>
 </div>
 
@@ -443,7 +477,8 @@ ${mauData.map((d, i) => `<tr class="${i === 0 ? "today" : ""}"><td>${d.month}${i
 
 <p style="color:#999;font-size:12px;margin-top:40px;">
 * DAU/MAU는 익명 설치 ID 기준이며, 한 사람이 여러 기기에 설치하면 중복 계산될 수 있습니다.<br>
-* Retention은 코드 적용 이후 가입한 사용자부터 정확히 측정됩니다.
+* Retention은 코드 적용 이후 가입한 사용자부터 정확히 측정됩니다.<br>
+* DAU 데이터는 1년간 보관됩니다.
 </p>
 </body>
 </html>`;
