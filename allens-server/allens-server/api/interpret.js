@@ -1,7 +1,8 @@
 // api/interpret.js
 // Vercel 서버리스 함수
-// - 서버 캐시: 한 번 해석한 문제는 Redis에 영구 저장하여 재호출 시 AI 비용 절약
-// - 캐시 키는 지문 텍스트의 해시로 생성 (확장 프로그램 수정 불필요)
+// - 서버 캐시: 한 번 해석한 문제는 Redis에 영구 저장
+// - 모델: gpt-5.4 (Standard)
+// - 캐시 키 prefix: problem_cache_v2 (모델 변경에 따라 기존 캐시와 분리)
 
 import { createClient } from "redis";
 import crypto from "crypto";
@@ -38,7 +39,6 @@ const RETENTION_MAU_SNAP = 365 * DAY;
 const RETENTION_COHORT = 365 * DAY;
 const RETENTION_FIRST_SEEN = 730 * DAY;
 
-// 지문 텍스트의 해시 (캐시 키용)
 function hashText(text) {
   return crypto.createHash("sha256").update(text).digest("hex").substring(0, 16);
 }
@@ -96,15 +96,13 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "텍스트가 너무 깁니다." });
   }
 
-  // 사용량 기록 (캐시 히트든 미스든 동일하게)
   recordUsage(userId);
 
   try {
     const redis = await getRedis();
 
-    // ─── 캐시 확인 ───
-    // 캐시 키는 지문 해시. 같은 지문이면 캐시 히트, 지문 수정되면 자동으로 새 호출
-    const cacheKey = `problem_cache:${hashText(questionText)}`;
+    // ─── 캐시 확인 (새 prefix: v2) ───
+    const cacheKey = `problem_cache_v2:${hashText(questionText)}`;
     const cached = await redis.get(cacheKey);
 
     if (cached) {
@@ -112,8 +110,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ data: JSON.parse(cached) });
     }
 
-    // ─── 캐시 없음 → AI 호출 ───
-    console.log("[캐시 미스] AI 호출");
+    console.log("[캐시 미스] gpt-5.4 호출");
 
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
@@ -166,7 +163,7 @@ ${explanationText}
         Authorization: "Bearer " + apiKey,
       },
       body: JSON.stringify({
-        model: "gpt-4o-mini",
+        model: "gpt-5.4",
         messages: [
           { role: "system", content: systemPrompt },
           { role: "user", content: userPrompt },
@@ -200,7 +197,7 @@ ${explanationText}
       return res.status(502).json({ error: "응답 형식 오류" });
     }
 
-    // ─── 결과를 캐시에 영구 저장 ───
+    // 결과를 새 prefix 캐시에 영구 저장
     await redis.set(cacheKey, JSON.stringify(parsed.interpretations));
 
     return res.status(200).json({ data: parsed.interpretations });
