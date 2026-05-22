@@ -2,6 +2,7 @@
 // Vercel 서버리스 함수
 // - 서버 캐시: gpt-5.4 결과 영구 저장
 // - 토큰 사용량 추적: 호출마다 입력/출력 토큰 누적
+// - v3 정규화 캐시 + v2 호환성 (페이지 간 캐시 공유)
 
 import { createClient } from "redis";
 import crypto from "crypto";
@@ -37,10 +38,21 @@ const RETENTION_CALLS = 365 * DAY;
 const RETENTION_MAU_SNAP = 365 * DAY;
 const RETENTION_COHORT = 365 * DAY;
 const RETENTION_FIRST_SEEN = 730 * DAY;
-const RETENTION_TOKENS = 730 * DAY; // 토큰 기록은 2년
+const RETENTION_TOKENS = 730 * DAY;
 
 function hashText(text) {
   return crypto.createHash("sha256").update(text).digest("hex").substring(0, 16);
+}
+
+// ─────────────────────────────────────────────────────────
+// 텍스트 정규화
+// 같은 지문이라도 페이지마다 미세한 공백/줄바꿈 차이가 있을 수 있으므로
+// 정규화해서 일관된 캐시 키 생성
+// ─────────────────────────────────────────────────────────
+function normalizeText(text) {
+  return text
+    .replace(/\s+/g, " ")  // 모든 공백/줄바꿈을 단일 공백으로
+    .trim();
 }
 
 async function recordUsage(userId) {
@@ -77,14 +89,12 @@ async function recordUsage(userId) {
   }
 }
 
-// AI 토큰 사용량 누적 기록
 async function recordTokens(promptTokens, completionTokens) {
   try {
     const redis = await getRedis();
     const today = getKoreaDate();
     const month = today.substring(0, 7);
 
-    // 오늘 / 이번달 / 전체 각각 누적
     await redis.incrBy(`tokens_prompt:${today}`, promptTokens);
     await redis.incrBy(`tokens_completion:${today}`, completionTokens);
     await redis.expire(`tokens_prompt:${today}`, RETENTION_TOKENS);
@@ -98,7 +108,6 @@ async function recordTokens(promptTokens, completionTokens) {
     await redis.incrBy(`tokens_prompt:total`, promptTokens);
     await redis.incrBy(`tokens_completion:total`, completionTokens);
 
-    // AI 호출 횟수 (캐시 미스 = 실제 AI 호출)
     await redis.incr(`ai_calls:${today}`);
     await redis.incr(`ai_calls:${month}`);
     await redis.incr(`ai_calls:total`);
@@ -133,15 +142,30 @@ export default async function handler(req, res) {
   try {
     const redis = await getRedis();
 
-    // 캐시 확인
-    const cacheKey = `problem_cache_v2:${hashText(questionText)}`;
-    const cached = await redis.get(cacheKey);
+    // ─── 캐시 키 만들기 ───
+    // v3: 정규화된 텍스트 기반 (페이지 간 공유됨)
+    // v2: 원본 텍스트 기반 (기존 캐시, 호환성 유지)
+    const normalizedText = normalizeText(questionText);
+    const cacheKeyV3 = `problem_cache_v3:${hashText(normalizedText)}`;
+    const cacheKeyV2 = `problem_cache_v2:${hashText(questionText)}`;
 
-    if (cached) {
-      console.log("[캐시 히트] 키:", cacheKey);
-      return res.status(200).json({ data: JSON.parse(cached) });
+    // 1순위: v3 정규화 캐시 조회
+    const cachedV3 = await redis.get(cacheKeyV3);
+    if (cachedV3) {
+      console.log("[캐시 히트 v3]");
+      return res.status(200).json({ data: JSON.parse(cachedV3) });
     }
 
+    // 2순위: v2 기존 캐시 조회 (호환성)
+    const cachedV2 = await redis.get(cacheKeyV2);
+    if (cachedV2) {
+      console.log("[캐시 히트 v2 → v3로 마이그레이션]");
+      // v3 키로도 저장해서 다음번엔 v3에서 바로 적중
+      await redis.set(cacheKeyV3, cachedV2);
+      return res.status(200).json({ data: JSON.parse(cachedV2) });
+    }
+
+    // 3순위: 캐시 없음 → AI 호출
     console.log("[캐시 미스] gpt-5.4 호출");
 
     const apiKey = process.env.OPENAI_API_KEY;
@@ -214,12 +238,10 @@ ${explanationText}
     const openaiData = await openaiRes.json();
     const content = openaiData.choices?.[0]?.message?.content;
 
-    // ─── 토큰 사용량 기록 ───
     if (openaiData.usage) {
       const promptTokens = openaiData.usage.prompt_tokens || 0;
       const completionTokens = openaiData.usage.completion_tokens || 0;
       console.log(`[토큰] prompt=${promptTokens}, completion=${completionTokens}`);
-      // 비동기로 기록 (응답 차단 안 함)
       recordTokens(promptTokens, completionTokens);
     }
 
@@ -238,7 +260,8 @@ ${explanationText}
       return res.status(502).json({ error: "응답 형식 오류" });
     }
 
-    await redis.set(cacheKey, JSON.stringify(parsed.interpretations));
+    // v3 키로 저장 (앞으로는 정규화된 키 사용)
+    await redis.set(cacheKeyV3, JSON.stringify(parsed.interpretations));
 
     return res.status(200).json({ data: parsed.interpretations });
 
