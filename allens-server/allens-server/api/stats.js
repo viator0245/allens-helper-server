@@ -82,15 +82,31 @@ export default async function handler(req, res) {
     const today = getKoreaDate(0);
     const currentMonth = today.substring(0, 7);
 
-    // DB에 저장된 문제 수
+    // DB에 저장된 문제 수 (v2 + v3 캐시, 중복 제외)
     let cachedProblemCount = 0;
     try {
+      // v3 정규화 캐시 (현재 메인)
+      const v3Hashes = new Set();
       let cursor = 0;
+      do {
+        const result = await redis.scan(cursor, { MATCH: "problem_cache_v3:*", COUNT: 1000 });
+        cursor = result.cursor;
+        for (const key of result.keys) {
+          v3Hashes.add(key.replace("problem_cache_v3:", ""));
+        }
+      } while (cursor !== 0);
+
+      // v2 기존 캐시 (호환성, v3과 별개 카운트)
+      let v2OnlyCount = 0;
+      cursor = 0;
       do {
         const result = await redis.scan(cursor, { MATCH: "problem_cache_v2:*", COUNT: 1000 });
         cursor = result.cursor;
-        cachedProblemCount += result.keys.length;
+        v2OnlyCount += result.keys.length;
       } while (cursor !== 0);
+
+      // v3 + v2 합산 (중복 가능성 있지만 대략적인 진행률용)
+      cachedProblemCount = v3Hashes.size + v2OnlyCount;
     } catch (e) {
       console.error("캐시 개수 조회 실패:", e);
     }
