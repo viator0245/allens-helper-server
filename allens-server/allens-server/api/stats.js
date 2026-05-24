@@ -192,6 +192,11 @@ export default async function handler(req, res) {
       await redis.del("temp:total_users");
     } catch (e) { totalUsers = 0; }
 
+    // cohort 추적 시작 이전에 가입한 사용자 보정
+    // (배포 직후 retention 통계를 만들기 전에 가입한 12명이 cohort에 없음)
+    const LEGACY_USERS_OFFSET = 12;
+    totalUsers += LEGACY_USERS_OFFSET;
+
     const dauKeys7 = [];
     for (let i = 0; i < 7; i++) dauKeys7.push(`dau:${getKoreaDate(-i)}`);
     let active7 = 0;
@@ -324,8 +329,8 @@ export default async function handler(req, res) {
       };
     }
 
-    const hourlyChart = buildHourlyChart(hourlyData, 100, 10, "#4f46e5");
-    const cumulativeChart = buildHourlyChart(cumulativeData, 300, 20, "#10b981");
+    const hourlyChart = buildHourlyChart(hourlyData, 150, 10, "#4f46e5");
+    const cumulativeChart = buildHourlyChart(cumulativeData, 1000, 100, "#10b981");
 
     // 일별 MAU 그래프
     const maxMau = Math.max(...dailyMauData.map((d) => d.mau), 10);
