@@ -216,6 +216,102 @@ export default async function handler(req, res) {
     const rolling7 = totalUsers > 0 ? ((active7 / totalUsers) * 100).toFixed(1) : 0;
     const rolling30 = totalUsers > 0 ? ((active30 / totalUsers) * 100).toFixed(1) : 0;
 
+    // ─────────────────────────────────────────────────────
+    // 전략용 카운터: 사용자별 일별 호출수
+    // 무료 한도 결정용 데이터 수집 (측정 시작: 2026-05-27, TTL 14일)
+    // ─────────────────────────────────────────────────────
+    const STRATEGY_START_DATE = "2026-05-27";
+    const STRATEGY_DAYS = 14;
+    const strategyDates = [];
+    for (let i = 0; i < STRATEGY_DAYS; i++) {
+      strategyDates.push(getKoreaDate(-i));
+    }
+
+    // 모든 user_calls 키 스캔 (TTL 14일이라 전체도 부담 적음)
+    let userCallsKeys = [];
+    try {
+      let cursor = 0;
+      do {
+        const result = await redis.scan(cursor, { MATCH: "user_calls:*", COUNT: 500 });
+        cursor = result.cursor;
+        userCallsKeys = userCallsKeys.concat(result.keys);
+      } while (cursor !== 0);
+    } catch (e) {
+      console.error("user_calls scan 실패:", e);
+    }
+
+    // userId별 → 날짜별 호출수 맵 구성
+    const userCallsMap = {}; // { userId: { date: count } }
+    if (userCallsKeys.length > 0) {
+      try {
+        const values = await Promise.all(
+          userCallsKeys.map((k) => redis.get(k))
+        );
+        userCallsKeys.forEach((key, idx) => {
+          // key 형식: user_calls:userId:날짜
+          const parts = key.split(":");
+          if (parts.length < 3) return;
+          const date = parts[parts.length - 1];
+          const userId = parts.slice(1, parts.length - 1).join(":");
+          const count = parseInt(values[idx], 10) || 0;
+          if (count === 0) return;
+          if (!userCallsMap[userId]) userCallsMap[userId] = {};
+          userCallsMap[userId][date] = count;
+        });
+      } catch (e) {
+        console.error("user_calls 값 조회 실패:", e);
+      }
+    }
+
+    // 사용자별 7일 / 14일 누적 호출수 계산
+    const last7Dates = strategyDates.slice(0, 7);
+    const last14Dates = strategyDates.slice(0, 14);
+    const userTotals = []; // [{ userId, total7, total14, daily: {date: count} }]
+
+    for (const userId of Object.keys(userCallsMap)) {
+      const daily = userCallsMap[userId];
+      let total7 = 0;
+      let total14 = 0;
+      for (const d of last7Dates) total7 += daily[d] || 0;
+      for (const d of last14Dates) total14 += daily[d] || 0;
+      userTotals.push({ userId, total7, total14, daily });
+    }
+
+    // TOP 20 헤비유저 (14일 기준 내림차순)
+    const top20Heavy = [...userTotals]
+      .sort((a, b) => b.total14 - a.total14)
+      .slice(0, 20);
+
+    // LOW 20 라이트유저 (14일 기준 오름차순, 단 1회 이상)
+    const low20Light = [...userTotals]
+      .filter((u) => u.total14 > 0)
+      .sort((a, b) => a.total14 - b.total14)
+      .slice(0, 20);
+
+    // 분포 통계: 10회 단위 (1~10, 11~20, ..., 91~100, 100+)
+    function buildBuckets(totals) {
+      const buckets = {};
+      for (let b = 0; b < 10; b++) {
+        const lo = b * 10 + 1;
+        const hi = (b + 1) * 10;
+        buckets[`${lo}~${hi}`] = 0;
+      }
+      buckets["101+"] = 0;
+      for (const t of totals) {
+        if (t < 1) continue;
+        if (t > 100) { buckets["101+"]++; continue; }
+        const bucketIdx = Math.floor((t - 1) / 10);
+        const lo = bucketIdx * 10 + 1;
+        const hi = (bucketIdx + 1) * 10;
+        buckets[`${lo}~${hi}`]++;
+      }
+      return buckets;
+    }
+    const dist7 = buildBuckets(userTotals.map((u) => u.total7));
+    const dist14 = buildBuckets(userTotals.map((u) => u.total14));
+    const totalUsers7 = userTotals.filter((u) => u.total7 > 0).length;
+    const totalUsers14 = userTotals.filter((u) => u.total14 > 0).length;
+
     // Cohort Retention
     const COHORT_WEEKS = 12;
     const thisWeekMonday = getMondayOfWeek(today);
@@ -449,6 +545,32 @@ th { background: #f9fafb; font-weight: 600; }
 .cohort-table thead th { background: #f3f4f6; color: #4b5563; }
 .cohort-scroll { overflow-x: auto; }
 
+/* 전략용 카운터 */
+.strategy-info-box {
+  padding: 14px 18px; background: #fef3c7; border-left: 4px solid #f59e0b;
+  border-radius: 6px; font-size: 13px; line-height: 1.7; margin-bottom: 16px; color: #78350f;
+}
+.matrix-scroll { overflow-x: auto; margin-bottom: 24px; }
+.user-matrix {
+  border-collapse: collapse; background: white; border-radius: 6px;
+  font-size: 11px; min-width: 800px; width: 100%;
+}
+.user-matrix th, .user-matrix td {
+  text-align: center; padding: 4px 6px; border: 1px solid #e5e7eb; white-space: nowrap;
+}
+.user-matrix thead th { background: #f3f4f6; color: #4b5563; font-weight: 600; }
+.user-matrix .user-col { text-align: left; font-family: monospace; font-size: 10px; color: #6b7280; min-width: 110px; }
+.user-matrix .total-col { background: #f9fafb; font-weight: 600; min-width: 50px; }
+
+.dist-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.dist-table th, .dist-table td { padding: 6px 8px; border-bottom: 1px solid #e5e7eb; text-align: left; }
+.dist-table thead th { background: #f3f4f6; color: #4b5563; font-weight: 600; font-size: 11px; }
+.dist-table td:first-child { font-family: monospace; min-width: 70px; }
+.dist-table td:nth-child(2) { min-width: 60px; }
+.dist-bar-wrap { display: flex; align-items: center; gap: 8px; }
+.dist-bar { height: 14px; border-radius: 3px; min-width: 1px; }
+.dist-pct { font-size: 11px; color: #6b7280; min-width: 40px; }
+
 .cost-box { margin-top: 16px; padding: 20px; background: #f9fafb; border-radius: 8px; }
 .cost-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
 .cost-card { background: white; padding: 16px; border-radius: 6px; border: 1px solid #e5e7eb; }
@@ -524,6 +646,129 @@ th { background: #f9fafb; font-weight: 600; }
     각 행 = 그 주에 처음 들어온 사용자 코호트 · W0 = 가입한 주차, W1 = 그 다음 주, ...<br>
     예: "W2 30%" = 가입한 지 2주 후에도 30%가 다시 사용 · "–" = 측정 전 (미래)<br>
     색이 진할수록 retention 높음
+  </div>
+</div>
+
+<h2>🎯 전략용 카운터 (무료 한도 결정용 데이터)</h2>
+<div class="strategy-info-box">
+  <strong>측정 시작일:</strong> ${STRATEGY_START_DATE}<br>
+  <strong>측정 단위:</strong> 사용자별 일별 호출수 (캐시 적중 포함 모든 호출) · <strong>TTL:</strong> 14일<br>
+  <strong>목적:</strong> 유료화 시 무료 한도 결정용 데이터 수집
+</div>
+
+<h3>🔥 TOP 20 헤비유저 매트릭스 (14일 누적 기준 내림차순)</h3>
+<div class="matrix-scroll">
+  <table class="user-matrix">
+    <thead>
+      <tr>
+        <th class="user-col">User ID</th>
+        ${last14Dates.slice().reverse().map((d) => `<th>${d.substring(5)}</th>`).join("")}
+        <th class="total-col">7일 합</th>
+        <th class="total-col">14일 합</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${top20Heavy.length === 0
+        ? `<tr><td colspan="${last14Dates.length + 3}" style="text-align:center;color:#9ca3af;padding:20px;">데이터 수집 중...</td></tr>`
+        : top20Heavy.map((u) => `
+        <tr>
+          <td class="user-col" title="${u.userId}">${u.userId.substring(0, 12)}...</td>
+          ${last14Dates.slice().reverse().map((d) => {
+            const v = u.daily[d] || 0;
+            const opacity = Math.min(v / 30, 1);
+            const bg = v > 0 ? `background: rgba(239,68,68,${opacity * 0.8});color:${opacity > 0.5 ? "white" : "#111"};` : "color:#d1d5db;";
+            return `<td style="${bg}">${v || "·"}</td>`;
+          }).join("")}
+          <td class="total-col"><strong>${u.total7}</strong></td>
+          <td class="total-col"><strong>${u.total14}</strong></td>
+        </tr>
+      `).join("")}
+    </tbody>
+  </table>
+</div>
+
+<h3>💧 LOW 20 라이트유저 매트릭스 (14일 누적 1회 이상, 오름차순)</h3>
+<div class="matrix-scroll">
+  <table class="user-matrix">
+    <thead>
+      <tr>
+        <th class="user-col">User ID</th>
+        ${last14Dates.slice().reverse().map((d) => `<th>${d.substring(5)}</th>`).join("")}
+        <th class="total-col">7일 합</th>
+        <th class="total-col">14일 합</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${low20Light.length === 0
+        ? `<tr><td colspan="${last14Dates.length + 3}" style="text-align:center;color:#9ca3af;padding:20px;">데이터 수집 중...</td></tr>`
+        : low20Light.map((u) => `
+        <tr>
+          <td class="user-col" title="${u.userId}">${u.userId.substring(0, 12)}...</td>
+          ${last14Dates.slice().reverse().map((d) => {
+            const v = u.daily[d] || 0;
+            const opacity = Math.min(v / 10, 1);
+            const bg = v > 0 ? `background: rgba(59,130,246,${opacity * 0.6});color:${opacity > 0.5 ? "white" : "#111"};` : "color:#d1d5db;";
+            return `<td style="${bg}">${v || "·"}</td>`;
+          }).join("")}
+          <td class="total-col"><strong>${u.total7}</strong></td>
+          <td class="total-col"><strong>${u.total14}</strong></td>
+        </tr>
+      `).join("")}
+    </tbody>
+  </table>
+</div>
+
+<h3>📊 사용자별 누적 호출수 분포 (10회 단위)</h3>
+<div class="dual-chart-row">
+  <div class="dual-chart-box">
+    <div class="chart-title">최근 7일 누적 분포 (${totalUsers7}명)</div>
+    <table class="dist-table">
+      <thead>
+        <tr><th>호출 범위</th><th>사용자 수</th><th>비율</th></tr>
+      </thead>
+      <tbody>
+        ${Object.entries(dist7).map(([range, count]) => {
+          const pct = totalUsers7 > 0 ? ((count / totalUsers7) * 100).toFixed(1) : "0.0";
+          const barWidth = totalUsers7 > 0 ? (count / totalUsers7) * 100 : 0;
+          return `
+          <tr>
+            <td>${range}회</td>
+            <td>${count}명</td>
+            <td>
+              <div class="dist-bar-wrap">
+                <div class="dist-bar" style="width:${barWidth}%;background:#4f46e5;"></div>
+                <span class="dist-pct">${pct}%</span>
+              </div>
+            </td>
+          </tr>`;
+        }).join("")}
+      </tbody>
+    </table>
+  </div>
+  <div class="dual-chart-box">
+    <div class="chart-title">최근 14일 누적 분포 (${totalUsers14}명)</div>
+    <table class="dist-table">
+      <thead>
+        <tr><th>호출 범위</th><th>사용자 수</th><th>비율</th></tr>
+      </thead>
+      <tbody>
+        ${Object.entries(dist14).map(([range, count]) => {
+          const pct = totalUsers14 > 0 ? ((count / totalUsers14) * 100).toFixed(1) : "0.0";
+          const barWidth = totalUsers14 > 0 ? (count / totalUsers14) * 100 : 0;
+          return `
+          <tr>
+            <td>${range}회</td>
+            <td>${count}명</td>
+            <td>
+              <div class="dist-bar-wrap">
+                <div class="dist-bar" style="width:${barWidth}%;background:#10b981;"></div>
+                <span class="dist-pct">${pct}%</span>
+              </div>
+            </td>
+          </tr>`;
+        }).join("")}
+      </tbody>
+    </table>
   </div>
 </div>
 
