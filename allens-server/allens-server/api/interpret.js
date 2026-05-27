@@ -39,6 +39,9 @@ const RETENTION_MAU_SNAP = 365 * DAY;
 const RETENTION_COHORT = 365 * DAY;
 const RETENTION_FIRST_SEEN = 730 * DAY;
 const RETENTION_TOKENS = 730 * DAY;
+// 전략용 카운터 (사용자별 일별 호출수) - 무료 한도 결정용 데이터 수집
+// 측정 시작: 2026-05-27
+const RETENTION_USER_CALLS = 14 * DAY;
 
 function hashText(text) {
   return crypto.createHash("sha256").update(text).digest("hex").substring(0, 16);
@@ -84,6 +87,11 @@ async function recordUsage(userId) {
       await redis.expire(`cohort:${today}`, RETENTION_COHORT);
       await redis.expire(firstSeenKey, RETENTION_FIRST_SEEN);
     }
+
+    // 전략용 카운터: 사용자별 일별 호출수 (TTL 14일)
+    // 캐시 적중 포함 모든 호출 카운트
+    await redis.incr(`user_calls:${userId}:${today}`);
+    await redis.expire(`user_calls:${userId}:${today}`, RETENTION_USER_CALLS);
   } catch (err) {
     console.error("사용량 기록 실패:", err);
   }
