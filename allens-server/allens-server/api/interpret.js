@@ -40,8 +40,8 @@ const RETENTION_COHORT = 365 * DAY;
 const RETENTION_FIRST_SEEN = 730 * DAY;
 const RETENTION_TOKENS = 730 * DAY;
 // 전략용 카운터 (사용자별 일별 호출수) - 무료 한도 결정용 데이터 수집
-// 측정 시작: 2026-05-27
-const RETENTION_USER_CALLS = 14 * DAY;
+// 측정 시작: 2026-05-27, TTL 30일 (7/14/28일 누적 분석용)
+const RETENTION_USER_CALLS = 30 * DAY;
 
 function hashText(text) {
   return crypto.createHash("sha256").update(text).digest("hex").substring(0, 16);
