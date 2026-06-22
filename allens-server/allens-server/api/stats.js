@@ -221,13 +221,13 @@ export default async function handler(req, res) {
     // 무료 한도 결정용 데이터 수집 (측정 시작: 2026-05-27, TTL 14일)
     // ─────────────────────────────────────────────────────
     const STRATEGY_START_DATE = "2026-05-27";
-    const STRATEGY_DAYS = 14;
+    const STRATEGY_DAYS = 28;
     const strategyDates = [];
     for (let i = 0; i < STRATEGY_DAYS; i++) {
       strategyDates.push(getKoreaDate(-i));
     }
 
-    // 모든 user_calls 키 스캔 (TTL 14일이라 전체도 부담 적음)
+    // 모든 user_calls 키 스캔 (TTL 30일)
     let userCallsKeys = [];
     try {
       let cursor = 0;
@@ -263,30 +263,33 @@ export default async function handler(req, res) {
       }
     }
 
-    // 사용자별 7일 / 14일 누적 호출수 계산
+    // 사용자별 7일 / 14일 / 28일 누적 호출수 계산
     const last7Dates = strategyDates.slice(0, 7);
     const last14Dates = strategyDates.slice(0, 14);
-    const userTotals = []; // [{ userId, total7, total14, daily: {date: count} }]
+    const last28Dates = strategyDates.slice(0, 28);
+    const userTotals = []; // [{ userId, total7, total14, total28, daily: {date: count} }]
 
     for (const userId of Object.keys(userCallsMap)) {
       const daily = userCallsMap[userId];
       let total7 = 0;
       let total14 = 0;
+      let total28 = 0;
       for (const d of last7Dates) total7 += daily[d] || 0;
       for (const d of last14Dates) total14 += daily[d] || 0;
-      userTotals.push({ userId, total7, total14, daily });
+      for (const d of last28Dates) total28 += daily[d] || 0;
+      userTotals.push({ userId, total7, total14, total28, daily });
     }
 
-    // TOP 20 헤비유저 (14일 기준 내림차순)
-    const top20Heavy = [...userTotals]
-      .sort((a, b) => b.total14 - a.total14)
-      .slice(0, 20);
+    // TOP 40 헤비유저 (28일 누적 기준 내림차순)
+    const top40Heavy = [...userTotals]
+      .sort((a, b) => b.total28 - a.total28)
+      .slice(0, 40);
 
-    // LOW 20 라이트유저 (14일 기준 오름차순, 단 1회 이상)
-    const low20Light = [...userTotals]
-      .filter((u) => u.total14 > 0)
-      .sort((a, b) => a.total14 - b.total14)
-      .slice(0, 20);
+    // LOW 30 라이트유저 (28일 누적 기준 오름차순, 단 1회 이상)
+    const low30Light = [...userTotals]
+      .filter((u) => u.total28 > 0)
+      .sort((a, b) => a.total28 - b.total28)
+      .slice(0, 30);
 
     // 분포 통계: 10회 단위 (1~10, 11~20, ..., 91~100, 100+)
     function buildBuckets(totals) {
@@ -309,8 +312,10 @@ export default async function handler(req, res) {
     }
     const dist7 = buildBuckets(userTotals.map((u) => u.total7));
     const dist14 = buildBuckets(userTotals.map((u) => u.total14));
+    const dist28 = buildBuckets(userTotals.map((u) => u.total28));
     const totalUsers7 = userTotals.filter((u) => u.total7 > 0).length;
     const totalUsers14 = userTotals.filter((u) => u.total14 > 0).length;
+    const totalUsers28 = userTotals.filter((u) => u.total28 > 0).length;
 
     // Cohort Retention
     const COHORT_WEEKS = 12;
@@ -652,28 +657,29 @@ th { background: #f9fafb; font-weight: 600; }
 <h2>🎯 전략용 카운터 (무료 한도 결정용 데이터)</h2>
 <div class="strategy-info-box">
   <strong>측정 시작일:</strong> ${STRATEGY_START_DATE}<br>
-  <strong>측정 단위:</strong> 사용자별 일별 호출수 (캐시 적중 포함 모든 호출) · <strong>TTL:</strong> 14일<br>
+  <strong>측정 단위:</strong> 사용자별 일별 호출수 (캐시 적중 포함 모든 호출) · <strong>TTL:</strong> 30일<br>
   <strong>목적:</strong> 유료화 시 무료 한도 결정용 데이터 수집
 </div>
 
-<h3>🔥 TOP 20 헤비유저 매트릭스 (14일 누적 기준 내림차순)</h3>
+<h3>🔥 TOP 40 헤비유저 매트릭스 (28일 누적 기준 내림차순)</h3>
 <div class="matrix-scroll">
   <table class="user-matrix">
     <thead>
       <tr>
         <th class="user-col">User ID</th>
-        ${last14Dates.slice().reverse().map((d) => `<th>${d.substring(5)}</th>`).join("")}
-        <th class="total-col">7일 합</th>
-        <th class="total-col">14일 합</th>
+        ${last28Dates.slice().reverse().map((d) => `<th>${d.substring(5)}</th>`).join("")}
+        <th class="total-col">7일</th>
+        <th class="total-col">14일</th>
+        <th class="total-col">28일</th>
       </tr>
     </thead>
     <tbody>
-      ${top20Heavy.length === 0
-        ? `<tr><td colspan="${last14Dates.length + 3}" style="text-align:center;color:#9ca3af;padding:20px;">데이터 수집 중...</td></tr>`
-        : top20Heavy.map((u) => `
+      ${top40Heavy.length === 0
+        ? `<tr><td colspan="${last28Dates.length + 4}" style="text-align:center;color:#9ca3af;padding:20px;">데이터 수집 중...</td></tr>`
+        : top40Heavy.map((u) => `
         <tr>
           <td class="user-col" title="${u.userId}">${u.userId.substring(0, 12)}...</td>
-          ${last14Dates.slice().reverse().map((d) => {
+          ${last28Dates.slice().reverse().map((d) => {
             const v = u.daily[d] || 0;
             const opacity = Math.min(v / 30, 1);
             const bg = v > 0 ? `background: rgba(239,68,68,${opacity * 0.8});color:${opacity > 0.5 ? "white" : "#111"};` : "color:#d1d5db;";
@@ -681,30 +687,32 @@ th { background: #f9fafb; font-weight: 600; }
           }).join("")}
           <td class="total-col"><strong>${u.total7}</strong></td>
           <td class="total-col"><strong>${u.total14}</strong></td>
+          <td class="total-col"><strong>${u.total28}</strong></td>
         </tr>
       `).join("")}
     </tbody>
   </table>
 </div>
 
-<h3>💧 LOW 20 라이트유저 매트릭스 (14일 누적 1회 이상, 오름차순)</h3>
+<h3>💧 LOW 30 라이트유저 매트릭스 (28일 누적 1회 이상, 오름차순)</h3>
 <div class="matrix-scroll">
   <table class="user-matrix">
     <thead>
       <tr>
         <th class="user-col">User ID</th>
-        ${last14Dates.slice().reverse().map((d) => `<th>${d.substring(5)}</th>`).join("")}
-        <th class="total-col">7일 합</th>
-        <th class="total-col">14일 합</th>
+        ${last28Dates.slice().reverse().map((d) => `<th>${d.substring(5)}</th>`).join("")}
+        <th class="total-col">7일</th>
+        <th class="total-col">14일</th>
+        <th class="total-col">28일</th>
       </tr>
     </thead>
     <tbody>
-      ${low20Light.length === 0
-        ? `<tr><td colspan="${last14Dates.length + 3}" style="text-align:center;color:#9ca3af;padding:20px;">데이터 수집 중...</td></tr>`
-        : low20Light.map((u) => `
+      ${low30Light.length === 0
+        ? `<tr><td colspan="${last28Dates.length + 4}" style="text-align:center;color:#9ca3af;padding:20px;">데이터 수집 중...</td></tr>`
+        : low30Light.map((u) => `
         <tr>
           <td class="user-col" title="${u.userId}">${u.userId.substring(0, 12)}...</td>
-          ${last14Dates.slice().reverse().map((d) => {
+          ${last28Dates.slice().reverse().map((d) => {
             const v = u.daily[d] || 0;
             const opacity = Math.min(v / 10, 1);
             const bg = v > 0 ? `background: rgba(59,130,246,${opacity * 0.6});color:${opacity > 0.5 ? "white" : "#111"};` : "color:#d1d5db;";
@@ -712,6 +720,7 @@ th { background: #f9fafb; font-weight: 600; }
           }).join("")}
           <td class="total-col"><strong>${u.total7}</strong></td>
           <td class="total-col"><strong>${u.total14}</strong></td>
+          <td class="total-col"><strong>${u.total28}</strong></td>
         </tr>
       `).join("")}
     </tbody>
@@ -762,6 +771,31 @@ th { background: #f9fafb; font-weight: 600; }
             <td>
               <div class="dist-bar-wrap">
                 <div class="dist-bar" style="width:${barWidth}%;background:#10b981;"></div>
+                <span class="dist-pct">${pct}%</span>
+              </div>
+            </td>
+          </tr>`;
+        }).join("")}
+      </tbody>
+    </table>
+  </div>
+  <div class="dual-chart-box">
+    <div class="chart-title">최근 28일 누적 분포 (${totalUsers28}명)</div>
+    <table class="dist-table">
+      <thead>
+        <tr><th>호출 범위</th><th>사용자 수</th><th>비율</th></tr>
+      </thead>
+      <tbody>
+        ${Object.entries(dist28).map(([range, count]) => {
+          const pct = totalUsers28 > 0 ? ((count / totalUsers28) * 100).toFixed(1) : "0.0";
+          const barWidth = totalUsers28 > 0 ? (count / totalUsers28) * 100 : 0;
+          return `
+          <tr>
+            <td>${range}회</td>
+            <td>${count}명</td>
+            <td>
+              <div class="dist-bar-wrap">
+                <div class="dist-bar" style="width:${barWidth}%;background:#f59e0b;"></div>
                 <span class="dist-pct">${pct}%</span>
               </div>
             </td>
